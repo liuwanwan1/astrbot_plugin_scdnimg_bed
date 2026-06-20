@@ -1,0 +1,7 @@
+name: astrbot_plugin_scdnimg_bed
+display_name: scdn 图床插件
+desc: 基于 img.scdn.io API 的 AstrBot 图床插件，支持上传图片、URL 上传与查询图片元数据。
+version: v1.0.0
+author: Clove.
+repo: "https://github.com/2164312714-svg/astrbot_plugin_scdnimg_bed"
+dependencies: []
