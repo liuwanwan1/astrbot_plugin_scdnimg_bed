@@ -6,7 +6,7 @@
 
 | 命令 | 作用 | 支持的图片来源 |
 |------|------|----------------|
-| `/图床上传` | 上传图片到 scdn 图床 | 附带图片、回复/引用图片消息、图片 URL、本地文件路径、base64 data URI |
+| `/图床上传` | 上传图片到 scdn 图床 | 附带图片、回复/引用图片消息、图片 URL、base64 data URI |
 | `/图床链接` | 通过远程图片 URL 上传 | HTTP/HTTPS 图片链接 |
 | `/图床查询` | 查询图片公开元数据 | 图片文件名、ID，或完整 scdn URL |
 | `/图床解析` | 解析 scdn 链接并把图片发回群里 | 完整 scdn URL |
@@ -98,12 +98,6 @@ https://github.com/2164312714-svg/astrbot_plugin_scdnimg_bed
 
 ```
 /图床上传 https://example.com/image.png --format=webp --storage=r2
-```
-
-**场景 D：本地文件路径**
-
-```
-/图床上传 C:\Users\Me\Pictures\cat.png
 ```
 
 #### 可用参数
@@ -239,6 +233,15 @@ ID: abc123
 ```
 
 ## 更新日志
+
+### v1.1.0
+
+- [安全] 移除 `/图床上传` 本地文件路径上传能力，彻底消除本地任意文件读取（LFI）风险
+- [安全] 修复 Telegram 回复取图把含 bot token 的下载 URL 外发给第三方图床 API 的凭据泄露问题：改为本地下载字节后上传，token 不再外发
+- [严重] `/图床解析` 现可识别全部 7 个已配置 CDN 域名，而非仅 `img.scdn.io`
+- [严重] 修复 aiocqhttp/NapCat 以 dict 形式承载回复段时无法提取回复图片的问题
+- [严重] 增强 aiocqhttp/NapCat 不同版本图片 URL 字段提取兼容性（多层下钻 + 失败告警）
+- [高] 修复 `/图床上传` base64 兜底分支逻辑空洞：dict 段不再误调 `convert_to_base64`，错误不再被静默吞掉
 
 ### v1.0.0
 

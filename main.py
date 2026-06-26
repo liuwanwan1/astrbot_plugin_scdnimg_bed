@@ -36,18 +36,38 @@ def _is_image_segment(seg) -> bool:
 
 
 def _extract_image_url_or_path(seg):
-    """从图片消息段中提取 URL、文件路径或 base64 字符串。"""
+    """从图片消息段中提取 URL、文件路径或 base64 字符串。
+
+    兼容 aiocqhttp/NapCat 不同版本的图片字段差异：对 data 下字段做多层下钻，
+    提取失败时记录 logger.warning 以便定位适配问题。
+    """
     if isinstance(seg, dict):
-        data = seg.get("data", {})
+        data = seg.get("data")
+        if not isinstance(data, dict):
+            data = {}
+        # 一级字段：经典 aiocqhttp 图片数据 {url, file, ...}
         for key in ("url", "file", "path", "image_url", "src"):
             value = data.get(key)
             if value:
                 return value
+        # 二级字段：部分 NapCat 版本把 url/file 嵌套在 subType 等子对象下
+        for sub in data.values():
+            if not isinstance(sub, dict):
+                continue
+            for key in ("url", "file", "path", "image_url", "src"):
+                value = sub.get(key)
+                if value:
+                    return value
+        logger.warning(
+            "未能从图片消息段(dict)提取 URL/路径，data 字段：%s",
+            list(data.keys()) if isinstance(data, dict) else data,
+        )
         return None
     for attr in ("url", "file", "path", "image_url", "src"):
         value = getattr(seg, attr, None)
         if value:
             return value
+    logger.warning("未能从图片消息段(%s)提取 URL/路径", type(seg).__name__)
     return None
 
 
@@ -79,7 +99,16 @@ def _extract_scdn_identifier(text: str) -> str:
     return text
 
 
-_SCDN_LINK_RE = re.compile(r"https?://img\.scdn\.io/i/([^/\s]+)")
+# 支持的全部 scdn CDN 域名；/图床解析 需识别其中任意一个，而非仅 img.scdn.io
+_SCDN_DOMAINS = (
+    "img.scdn.io",
+    "cloudflareimg.cdn.sn",
+    "edgeoneimg.cdn.sn",
+    "esaimg.cdn1.vip",
+    "cloudflarecnimg.scdn.io",
+    "anycastimg.scdn.io",
+    "edgeoneimg.cdn1.vip",
+)
 
 
 class ScdnImgBedPlugin(Star):
@@ -94,6 +123,14 @@ class ScdnImgBedPlugin(Star):
         self.default_output_format: str = config.get("default_output_format", "auto")
         self.timeout: int = config.get("timeout", 60)
         self.session: Optional[aiohttp.ClientSession] = None
+        # /图床解析 需识别全部已配置 CDN 域名，而不止 img.scdn.io
+        domains = set(_SCDN_DOMAINS)
+        if self.default_cdn_domain:
+            domains.add(self.default_cdn_domain)
+        domain_alt = "|".join(
+            re.escape(d) for d in sorted(domains, key=len, reverse=True)
+        )
+        self._scdn_link_re = re.compile(rf"https?://(?:{domain_alt})/i/([^/\s]+)")
 
     async def initialize(self) -> None:
         self.session = aiohttp.ClientSession()
@@ -261,16 +298,43 @@ class ScdnImgBedPlugin(Star):
         except Exception:
             return False
 
+    async def _download_bytes(self, url: str) -> Optional[bytes]:
+        """下载 URL 内容为字节，供本地处理后上传。
+
+        用于把含凭据（如 Telegram bot token）的下载链接在本地拉取，
+        避免把该 URL 外发给第三方图床 API 造成凭据泄露。
+        """
+        try:
+            async with self._http_session().get(
+                url, timeout=aiohttp.ClientTimeout(total=self.timeout)
+            ) as resp:
+                resp.raise_for_status()
+                return await resp.read()
+        except Exception:
+            logger.error("下载图片字节失败", exc_info=True)
+            return None
+
     async def _extract_reply_image(self, event: AstrMessageEvent) -> tuple:
-        """尝试从引用/回复的消息中提取图片。返回 (url, bytes)。
+        """尝试从引用/回复的消息中提取图片。返回 (url, bytes, filename)。
+
+        filename 仅在返回 bytes 时有意义（可为 None，由调用方用默认名）。
         兼容 aiocqhttp（QQ/NapCat）、Telegram 等常见平台，其余平台会尝试从 raw_message 推断。
         """
         message_chain = _get_message_chain(event)
 
         reply_id = None
         for seg in message_chain:
-            if getattr(seg, "type", None) in ("Reply", "reply") and getattr(seg, "id", None):
-                reply_id = seg.id
+            # 兼容 dict 形式（aiocqhttp raw message 段）与对象形式
+            if isinstance(seg, dict):
+                if seg.get("type") not in ("Reply", "reply"):
+                    continue
+                data = seg.get("data")
+                reply_id = data.get("id") if isinstance(data, dict) else seg.get("id")
+            else:
+                if getattr(seg, "type", None) not in ("Reply", "reply"):
+                    continue
+                reply_id = getattr(seg, "id", None)
+            if reply_id:
                 break
 
         platform = event.get_platform_name()
@@ -281,7 +345,12 @@ class ScdnImgBedPlugin(Star):
                 bot = getattr(event, "bot", None)
                 api = getattr(bot, "api", None)
                 if api is not None:
-                    result = await api.call_action("get_msg", message_id=reply_id)
+                    # dict 段取到的 id 常为字符串，OneBot v11 get_msg 需 int
+                    try:
+                        msg_id = int(reply_id)
+                    except (TypeError, ValueError):
+                        msg_id = reply_id
+                    result = await api.call_action("get_msg", message_id=msg_id)
                     if isinstance(result, dict):
                         reply_message = result.get("message", [])
                         if isinstance(reply_message, str):
@@ -291,10 +360,10 @@ class ScdnImgBedPlugin(Star):
                                 reply_message = []
                         url = self._extract_first_image_url(reply_message)
                         if url:
-                            return url, None
+                            return url, None, None
                         b64 = self._extract_first_image_base64(reply_message)
                         if b64:
-                            return None, base64.b64decode(b64)
+                            return None, base64.b64decode(b64), None
             except Exception:
                 logger.error("aiocqhttp 提取引用消息图片失败", exc_info=True)
 
@@ -316,7 +385,12 @@ class ScdnImgBedPlugin(Star):
                                 if file_path:
                                     token = getattr(getattr(bot, "session", None), "api_token", None)
                                     if token:
-                                        return f"https://api.telegram.org/file/bot{token}/{file_path}", None
+                                        # 本地下载字节后上传，避免把含 bot token 的 URL 外发给第三方图床 API
+                                        dl_url = f"https://api.telegram.org/file/bot{token}/{file_path}"
+                                        image_bytes = await self._download_bytes(dl_url)
+                                        if image_bytes:
+                                            ext = os.path.splitext(file_path)[1].lower() or ".jpg"
+                                            return None, image_bytes, f"telegram{ext}"
             except Exception:
                 logger.error("Telegram 提取引用消息图片失败", exc_info=True)
 
@@ -332,18 +406,18 @@ class ScdnImgBedPlugin(Star):
                         # 可能是消息对象或消息链
                         url = self._extract_first_image_url(replied.get("message", []))
                         if url:
-                            return url, None
+                            return url, None, None
                         url = self._extract_first_image_url(replied)
                         if url:
-                            return url, None
+                            return url, None, None
                     elif isinstance(replied, list):
                         url = self._extract_first_image_url(replied)
                         if url:
-                            return url, None
+                            return url, None, None
         except Exception:
             logger.error("通用提取引用消息图片失败", exc_info=True)
 
-        return None, None
+        return None, None, None
 
     @staticmethod
     def _extract_first_image_url(message_chain) -> Optional[str]:
@@ -413,34 +487,38 @@ class ScdnImgBedPlugin(Star):
                 image_url = value
                 break
 
-            # 可能没有 url，尝试 base64（AstrBot 部分实现）
-            if image_url is None:
-                try:
-                    b64 = await seg.convert_to_base64()
-                    if b64:
-                        image_bytes = base64.b64decode(b64)
-                        image_filename = "image.bin"
-                        break
-                except Exception:
-                    pass
-                # 直接取 base64 字段
-                b64 = getattr(seg, "base64", None) or getattr(seg, "b64", None)
+            # 当前段没有 URL/路径，尝试 base64 兜底
+            if value is None:
+                b64 = None
+                if isinstance(seg, dict):
+                    data = seg.get("data")
+                    if isinstance(data, dict):
+                        b64 = data.get("base64") or data.get("b64")
+                else:
+                    if isinstance(seg, Image):
+                        try:
+                            b64 = await seg.convert_to_base64()
+                        except Exception:
+                            logger.warning("从图片段转换 base64 失败", exc_info=True)
+                    if not b64:
+                        # 兼容直接携带 base64 字段的对象段
+                        b64 = getattr(seg, "base64", None) or getattr(seg, "b64", None)
                 if b64:
                     try:
                         image_bytes = base64.b64decode(b64)
                         image_filename = "image.bin"
                         break
                     except Exception:
-                        pass
+                        logger.warning("解码图片 base64 失败", exc_info=True)
 
         # 尝试从引用/回复消息中提取图片
         if image_url is None and image_bytes is None:
-            reply_url, reply_bytes = await self._extract_reply_image(event)
+            reply_url, reply_bytes, reply_filename = await self._extract_reply_image(event)
             if reply_url:
                 image_url = reply_url
             elif reply_bytes:
                 image_bytes = reply_bytes
-                image_filename = "image.bin"
+                image_filename = reply_filename or "image.bin"
 
         if image_url is None and image_bytes is None:
             # 没有附带图片，看看命令参数里是否提供了图片 URL
@@ -479,19 +557,8 @@ class ScdnImgBedPlugin(Star):
                         logger.error("解析图片 data URI 失败", exc_info=True)
                         yield event.plain_result("无法解析图片数据，请尝试重新发送图片。")
                         return
-                elif os.path.isfile(image_url):
-                    # 本地文件路径
-                    try:
-                        with open(image_url, "rb") as f:
-                            image_bytes = f.read()
-                        image_filename = os.path.basename(image_url)
-                        result = await self._upload_file(image_bytes, image_filename, extra)
-                    except Exception:
-                        logger.error("读取本地图片文件失败", exc_info=True)
-                        yield event.plain_result("读取本地图片失败，请检查文件路径是否正确。")
-                        return
                 else:
-                    yield event.plain_result("不支持的图片地址，请提供 HTTP/HTTPS 链接、本地文件路径或 base64 data URI。")
+                    yield event.plain_result("不支持的图片地址，请提供 HTTP/HTTPS 链接或 base64 data URI。")
                     return
             else:
                 result = await self._upload_file(image_bytes or b"", image_filename or "image.bin", extra)
@@ -570,7 +637,7 @@ class ScdnImgBedPlugin(Star):
             yield event.plain_result("请提供 scdn 图片链接。\n用法：/图床解析 <图片URL>")
             return
 
-        match = _SCDN_LINK_RE.search(url)
+        match = self._scdn_link_re.search(url)
         if not match:
             yield event.plain_result("请输入有效的 scdn 图片链接，如：https://img.scdn.io/i/xxx.webp")
             return
